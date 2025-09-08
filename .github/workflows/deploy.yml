@@ -1,0 +1,110 @@
+name: CAP CI/CD to Cloud Foundry
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    env:
+      MTAR_NAME: ${{ github.event.repository.name }}-${{ github.sha }}.mtar
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Clean install dependencies
+        run: |
+          set -euo pipefail
+          npm ci
+
+      - name: Validate CDS models
+        run: |
+          set -euo pipefail
+          npx cds --version >/dev/null 2>&1 || true
+          npx cds compile srv --to csn > /dev/null
+
+      - name: Run tests (if present)
+        run: |
+          set -euo pipefail
+          npm run -s test --if-present
+
+      - name: Build project (CDS build)
+        run: |
+          set -euo pipefail
+          npm run -s build
+
+      - name: Install Cloud MTA Build Tool
+        run: |
+          set -euo pipefail
+          npm install -g mbt
+
+      - name: Build MTAR
+        run: |
+          set -euo pipefail
+          mbt --version && \
+          rm -rf mta_archives dist && \
+          mbt build -t mta_archives && \
+          MTAR_FILE=$(ls -1 mta_archives/*.mtar | head -n 1) && \
+          echo "Built MTAR: ${MTAR_FILE}" && \
+          mkdir -p dist && \
+          cp "${MTAR_FILE}" "dist/${MTAR_NAME}"
+
+      - name: Upload MTAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtar
+          path: dist/${{ env.MTAR_NAME }}
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to Cloud Foundry
+    needs: build-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      MTAR_NAME: ${{ github.event.repository.name }}-${{ github.sha }}.mtar
+      CF_API: ${{ secrets.CF_API }}
+      CF_ORG: ${{ secrets.CF_ORG }}
+      CF_SPACE: ${{ secrets.CF_SPACE }}
+      CF_USERNAME: ${{ secrets.CF_USERNAME }}
+      CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
+      CF_SKIP_SSL_VALIDATION: ${{ secrets.CF_SKIP_SSL_VALIDATION }}
+    steps:
+      - name: Download MTAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mtar
+          path: dist
+
+      - name: Setup Cloud Foundry CLI and Login
+        uses: cloudfoundry/cf-cli-action@v2
+        with:
+          api: ${{ env.CF_API }}
+          username: ${{ env.CF_USERNAME }}
+          password: ${{ env.CF_PASSWORD }}
+          org: ${{ env.CF_ORG }}
+          space: ${{ env.CF_SPACE }}
+          skip_ssl_validation: ${{ env.CF_SKIP_SSL_VALIDATION }}
+
+      - name: Install CF MultiApps plugin
+        run: |
+          set -euo pipefail
+          cf add-plugin-repo CF-Community https://plugins.cloudfoundry.org && \
+          cf install-plugin -f -r CF-Community "multiapps" && \
+          cf plugins
+
+      - name: Deploy MTAR
+        run: |
+          set -euo pipefail
+          test -f "dist/${MTAR_NAME}" && \
+          cf deploy "dist/${MTAR_NAME}" -f
