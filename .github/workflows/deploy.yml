@@ -1,0 +1,147 @@
+name: CAP CI/CD to Cloud Foundry
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Verify lockfile exists
+        run: |
+          set -e
+          if [ ! -f package-lock.json ] && [ ! -f npm-shrinkwrap.json ]; then
+            echo "Error: No package-lock.json or npm-shrinkwrap.json found. npm ci requires a lockfile."
+            echo "Please run 'npm install' locally to generate/update the lock file and commit it."
+            exit 1
+          fi
+
+      - name: Install dependencies (npm ci)
+        run: |
+          set -e
+          npm ci
+
+      - name: Validate CDS model (csn compile)
+        run: |
+          set -e
+          npx cds compile srv --to csn > /dev/null
+
+      - name: Run unit tests (if script exists)
+        run: |
+          set -e
+          node -e "const p=require('./package.json'); if(!(p.scripts&&p.scripts.test)){process.exit(0)}"
+          npm test
+
+      - name: Build project (CDS build)
+        run: |
+          set -e
+          if npm run | grep -qE '^  build'; then
+            npm run build
+          else
+            echo "No build script found, skipping 'npm run build'."
+          fi
+
+      - name: Install SAP MBT (Multi-Target App Build Tool)
+        run: |
+          set -e
+          npm install -g @sap/mbt
+
+      - name: Build MTAR with consistent name and upload artifact
+        id: build_mtar
+        run: |
+          set -e
+          mbt build -t mta_archives
+          ART=$(ls -1 mta_archives/*.mtar | head -n 1)
+          if [ -z "$ART" ]; then
+            echo "No MTAR produced in mta_archives/. Ensure your project contains an mta.yaml."
+            exit 1
+          fi
+          REPO="${{ github.repository }}"
+          REPO_SAFE="${REPO//\//-}"
+          MTAR_NAME="${REPO_SAFE}-${{ github.sha }}.mtar"
+          cp "$ART" "$MTAR_NAME"
+          echo "mtar_name=$MTAR_NAME" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Upload MTAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtar
+          path: ${{ steps.build_mtar.outputs.mtar_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Cloud Foundry
+    runs-on: ubuntu-latest
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Download MTAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mtar
+          path: .
+
+      - name: Install Cloud Foundry CLI v8
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y curl gnupg
+          curl -fsSL https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key | sudo gpg --dearmor -o /usr/share/keyrings/cloudfoundry-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudfoundry-archive-keyring.gpg] https://packages.cloudfoundry.org/debian stable main" | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list
+          sudo apt-get update
+          sudo apt-get install -y cf8-cli
+
+      - name: Install CF MultiApps plugin
+        run: |
+          set -e
+          cf install-plugin -r CF-Community "multiapps" -f
+          cf plugins
+
+      - name: CF Login
+        env:
+          CF_API: ${{ secrets.CF_API }}
+          CF_USERNAME: ${{ secrets.CF_USERNAME }}
+          CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
+          CF_ORG: ${{ secrets.CF_ORG }}
+          CF_SPACE: ${{ secrets.CF_SPACE }}
+        run: |
+          set -e
+          if [ -z "$CF_API" ] || [ -z "$CF_USERNAME" ] || [ -z "$CF_PASSWORD" ] || [ -z "$CF_ORG" ] || [ -z "$CF_SPACE" ]; then
+            echo "Missing one or more required Cloud Foundry secrets (CF_API, CF_USERNAME, CF_PASSWORD, CF_ORG, CF_SPACE)."
+            exit 1
+          fi
+          cf api "$CF_API" --skip-ssl-validation
+          cf auth "$CF_USERNAME" "$CF_PASSWORD"
+          cf target -o "$CF_ORG" -s "$CF_SPACE"
+          cf target
+
+      - name: Deploy MTAR to Cloud Foundry
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -e
+          REPO_SAFE="${GITHUB_REPOSITORY//\//-}"
+          MTAR_NAME="${REPO_SAFE}-${GITHUB_SHA}.mtar"
+          if [ ! -f "$MTAR_NAME" ]; then
+            echo "Expected MTAR $MTAR_NAME not found in workspace."
+            echo "Files in workspace:"
+            ls -la
+            exit 1
+          fi
+          cf deploy "$MTAR_NAME" -f
