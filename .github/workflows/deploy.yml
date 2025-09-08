@@ -1,0 +1,112 @@
+name: SAP CAP CI/CD to Cloud Foundry
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: "20.x"
+  MTAR_DIR: mta_archives
+  MTAR_NAME: ${{ github.repository }}-${{ github.sha }}.mtar
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies (npm ci)
+        run: |
+          set -e
+          npm ci
+
+      - name: Validate CDS models
+        run: |
+          set -e
+          npx cds compile srv --to csn > /dev/null
+
+      - name: Run tests (if present)
+        run: |
+          set -e
+          npm test --if-present
+
+      - name: Build CDS
+        run: |
+          set -e
+          npm run build --if-present
+          npx cds build --production
+
+      - name: Install Cloud MTA Build Tool (mbt)
+        run: |
+          set -e
+          npm install -g mbt
+
+      - name: Build MTAR
+        run: |
+          set -e
+          mkdir -p "${{ env.MTAR_DIR }}"
+          mbt build -t "${{ env.MTAR_DIR }}"
+          MTAR_PATH=$(ls "${{ env.MTAR_DIR }}"/*.mtar | head -n 1)
+          SAFE_NAME=$(echo "${{ env.MTAR_NAME }}" | sed 's/\//-/g')
+          mv "$MTAR_PATH" "${{ env.MTAR_DIR }}/$SAFE_NAME"
+
+      - name: Upload MTAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cap-mtar-${{ github.sha }}
+          path: ${{ env.MTAR_DIR }}/*.mtar
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Cloud Foundry
+    runs-on: ubuntu-latest
+    needs: build-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    env:
+      CF_API: ${{ secrets.CF_API }}
+      CF_ORG: ${{ secrets.CF_ORG }}
+      CF_SPACE: ${{ secrets.CF_SPACE }}
+      CF_USERNAME: ${{ secrets.CF_USERNAME }}
+      CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
+    steps:
+      - name: Download MTAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cap-mtar-${{ github.sha }}
+          path: deploy_artifacts
+
+      - name: Install Cloud Foundry CLI and MultiApps plugin
+        run: |
+          set -e
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          curl -fsSL https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key | sudo gpg --dearmor -o /etc/apt/keyrings/cloudfoundry.org.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/cloudfoundry.org.gpg] https://packages.cloudfoundry.org/debian stable main" | sudo tee /etc/apt/sources.list.d/cloudfoundry.org.list
+          sudo apt-get update
+          sudo apt-get install -y cf7-cli
+          sudo ln -sf "$(command -v cf7)" /usr/local/bin/cf
+          cf --version
+          cf add-plugin-repo CF-Community https://plugins.cloudfoundry.org
+          cf install-plugin -r CF-Community -f multiapps
+          cf plugins
+
+      - name: Cloud Foundry Login
+        run: |
+          set -e
+          cf login -a "$CF_API" -u "$CF_USERNAME" -p "$CF_PASSWORD" -o "$CF_ORG" -s "$CF_SPACE"
+
+      - name: Deploy MTAR to Cloud Foundry
+        run: |
+          set -e
+          MTAR_FILE=$(ls deploy_artifacts/*.mtar | head -n 1)
+          test -f "$MTAR_FILE"
+          cf deploy "$MTAR_FILE" -f
