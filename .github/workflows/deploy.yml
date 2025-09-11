@@ -1,0 +1,140 @@
+name: CAP CI/CD (Cloud Foundry)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Clean install dependencies
+        run: |
+          set -e
+          npm ci
+
+      - name: Validate CDS models
+        run: |
+          set -e
+          npx cds compile srv --to csn
+
+      - name: Run tests if available
+        run: |
+          set -e
+          if npm run | grep -E "^\s*test" >/dev/null 2>&1; then
+            npm test
+          else
+            echo "No test script defined; skipping tests."
+          fi
+
+      - name: Build project
+        run: |
+          set -e
+          npm run build
+
+      - name: Build MTAR using mbt
+        run: |
+          set -e
+          npx -y -p mbt mbt build -p=cf -t mta_archives
+          mkdir -p artifact
+          MTAR_PATH="$(find mta_archives -maxdepth 1 -type f -name '*.mtar' | head -n 1)"
+          if [ -z "$MTAR_PATH" ]; then
+            echo "No MTAR file found in mta_archives"; exit 1
+          fi
+          cp "$MTAR_PATH" artifact/app.mtar
+          echo "MTAR_FILE=artifact/app.mtar" >> $GITHUB_ENV
+
+      - name: Upload MTAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtar-artifact
+          path: artifact/app.mtar
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Cloud Foundry
+    needs: build-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      CF_API: ${{ secrets.CF_API }}
+      CF_ORG: ${{ secrets.CF_ORG }}
+      CF_SPACE: ${{ secrets.CF_SPACE }}
+      CF_USERNAME: ${{ secrets.CF_USERNAME }}
+      CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download MTAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mtar-artifact
+          path: mtar
+
+      - name: Locate MTAR file
+        id: locate_mtar
+        run: |
+          set -e
+          MTAR_PATH="$(find mtar -type f -name '*.mtar' | head -n 1)"
+          if [ -z "$MTAR_PATH" ]; then
+            echo "No MTAR file found after artifact download"; exit 1
+          fi
+          echo "mtar_path=$MTAR_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cloud Foundry CLI v8 (binary)
+        run: |
+          set -e
+          wget -qO cf8.tgz "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8&source=github"
+          tar -xzf cf8.tgz
+          BIN_PATH="$(find . -type f -name 'cf' -o -name 'cf8' | head -n 1)"
+          if [ -z "$BIN_PATH" ]; then
+            echo "CF CLI binary not found in the archive"; exit 1
+          fi
+          sudo mv "$BIN_PATH" /usr/local/bin/cf
+          sudo chmod +x /usr/local/bin/cf
+          cf version
+
+      - name: Install CF MultiApps plugin
+        run: |
+          set -e
+          cf add-plugin-repo CF-Community https://plugins.cloudfoundry.org || true
+          cf install-plugin multiapps -r CF-Community -f
+          cf plugins
+
+      - name: CF Login
+        env:
+          CF_API: ${{ env.CF_API }}
+          CF_ORG: ${{ env.CF_ORG }}
+          CF_SPACE: ${{ env.CF_SPACE }}
+          CF_USERNAME: ${{ env.CF_USERNAME }}
+          CF_PASSWORD: ${{ env.CF_PASSWORD }}
+        run: |
+          set -e
+          if [ -z "$CF_API" ] || [ -z "$CF_ORG" ] || [ -z "$CF_SPACE" ] || [ -z "$CF_USERNAME" ] || [ -z "$CF_PASSWORD" ]; then
+            echo "One or more CF_* secrets are missing"; exit 1
+          fi
+          cf api "$CF_API"
+          cf auth "$CF_USERNAME" "$CF_PASSWORD"
+          cf target -o "$CF_ORG" -s "$CF_SPACE"
+
+      - name: Deploy MTAR to Cloud Foundry
+        run: |
+          set -e
+          MTAR="${{ steps.locate_mtar.outputs.mtar_path }}"
+          if [ ! -f "$MTAR" ]; then
+            echo "MTAR file not found at $MTAR"; exit 1
+          fi
+          cf deploy "$MTAR" -f
