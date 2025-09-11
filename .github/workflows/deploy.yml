@@ -1,0 +1,134 @@
+name: CI/CD - SAP CAP to Cloud Foundry
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.x
+
+      - name: Install dependencies (npm ci)
+        shell: bash
+        run: |
+          set -e
+          npm ci
+
+      - name: Validate CDS models (npx cds compile srv --to csn)
+        shell: bash
+        run: |
+          set -e
+          npx cds compile srv --to csn
+
+      - name: Run tests if present (npm test)
+        shell: bash
+        run: |
+          set -e
+          npm run -s test --if-present
+
+      - name: Build CAP project (npm run build)
+        shell: bash
+        run: |
+          set -e
+          npm run build
+
+      - name: Build MTAR (mbt)
+        shell: bash
+        run: |
+          set -e
+          npx -y -p mbt mbt build -t mta_archives
+
+      - name: Normalize MTAR filename
+        shell: bash
+        run: |
+          set -e
+          MTAR_PATH="$(find mta_archives -maxdepth 1 -type f -name "*.mtar" | head -n 1)"
+          if [ -z "$MTAR_PATH" ]; then
+            echo "No MTAR generated in mta_archives/"; exit 1
+          fi
+          mkdir -p dist
+          cp "$MTAR_PATH" dist/capire.flight.mtar
+          ls -l dist
+
+      - name: Upload MTAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtar
+          path: dist/capire.flight.mtar
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Cloud Foundry
+    runs-on: ubuntu-latest
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 30
+    steps:
+      - name: Download MTAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mtar
+          path: artifacts
+
+      - name: Install Cloud Foundry CLI v8 (Linux binary)
+        shell: bash
+        run: |
+          set -e
+          mkdir -p /tmp/cfcli && cd /tmp/cfcli
+          wget -q -O cf8.tgz "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8&source=github"
+          tar -xzf cf8.tgz
+          CF_BIN="$(find . -type f -name cf -print -quit)"
+          if [ -z "$CF_BIN" ]; then
+            echo "cf binary not found in extracted archive"; exit 1
+          fi
+          chmod +x "$CF_BIN"
+          sudo mv "$CF_BIN" /usr/local/bin/cf
+          cf version
+
+      - name: Install Multiapps plugin
+        shell: bash
+        run: |
+          set -e
+          cf add-plugin-repo CF-Community https://plugins.cloudfoundry.org || true
+          cf install-plugin -r CF-Community "multiapps" -f
+          cf plugins
+
+      - name: Prepare MTAR path
+        id: mtar
+        shell: bash
+        run: |
+          set -e
+          MTAR="$(find artifacts -type f -name "*.mtar" | head -n 1)"
+          if [ -z "$MTAR" ]; then
+            echo "No MTAR file found under artifacts/"; exit 1
+          fi
+          echo "MTAR file: $MTAR"
+          echo "mtar_path=$MTAR" >> "$GITHUB_OUTPUT"
+
+      - name: CF Login and Deploy
+        shell: bash
+        env:
+          CF_API: ${{ secrets.CF_API }}
+          CF_ORG: ${{ secrets.CF_ORG }}
+          CF_SPACE: ${{ secrets.CF_SPACE }}
+          CF_USERNAME: ${{ secrets.CF_USERNAME }}
+          CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
+        run: |
+          set -e
+          cf api "$CF_API"
+          cf auth "$CF_USERNAME" "$CF_PASSWORD"
+          cf target -o "$CF_ORG" -s "$CF_SPACE"
+          cf deploy "${{ steps.mtar.outputs.mtar_path }}" -f
