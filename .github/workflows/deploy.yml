@@ -1,0 +1,139 @@
+name: CAP CI/CD to Cloud Foundry
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18.x, 20.x]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Clean install dependencies
+        run: npm ci
+
+      - name: Validate CDS models
+        run: npx cds compile srv --to csn
+
+      - name: Run tests (if defined)
+        run: |
+          set -e
+          if node -e "const s=require('./package.json').scripts||{}; process.exit(s.test?0:1)"; then
+            npm test
+          else
+            echo 'No test script defined; skipping tests.'
+          fi
+
+      - name: Build CDS
+        run: npm run build
+
+      - name: Build MTAR (Node 20.x only)
+        if: matrix.node == '20.x'
+        run: |
+          set -e
+          mkdir -p mta_archives
+          npx -y -p mbt mbt --version
+          npx -y -p mbt mbt build -p=cf -t mta_archives --mtar capire.flight.mtar
+
+      - name: Upload MTAR artifact
+        if: matrix.node == '20.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtar
+          path: mta_archives/*.mtar
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Cloud Foundry
+    runs-on: ubuntu-latest
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download MTAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mtar
+          path: ./dist
+
+      - name: Locate MTAR file
+        id: find_mtar
+        run: |
+          set -e
+          MTAR_PATH=$(find ./dist -type f -name "*.mtar" | head -n 1)
+          if [ -z "$MTAR_PATH" ]; then
+            echo "No MTAR file found in downloaded artifacts." >&2
+            exit 1
+          fi
+          echo "Found MTAR at: $MTAR_PATH"
+          echo "mtar-path=$MTAR_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cloud Foundry CLI v8 (Linux binary)
+        run: |
+          set -e
+          TMP_DIR="$(mktemp -d)"
+          echo "Downloading CF CLI v8..."
+          wget -qO "$TMP_DIR/cf8.tgz" "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8&source=github"
+          tar -xzf "$TMP_DIR/cf8.tgz" -C "$TMP_DIR"
+          CF_CANDIDATE="$(find "$TMP_DIR" -type f -name 'cf' -o -name 'cf8' | head -n 1)"
+          if [ -z "$CF_CANDIDATE" ]; then
+            echo "CF CLI binary not found after extracting." >&2
+            exit 1
+          fi
+          sudo mv "$CF_CANDIDATE" /usr/local/bin/cf
+          sudo chmod +x /usr/local/bin/cf
+          cf version
+
+      - name: Install CF Multiapps plugin
+        run: |
+          set -e
+          cf install-plugin -f https://github.com/cloudfoundry/multiapps-cli-plugin/releases/latest/download/multiapps-plugin.linux64
+          cf plugins
+
+      - name: Cloud Foundry Login
+        env:
+          CF_API: ${{ secrets.CF_API }}
+          CF_USERNAME: ${{ secrets.CF_USERNAME }}
+          CF_PASSWORD: ${{ secrets.CF_PASSWORD }}
+          CF_ORG: ${{ secrets.CF_ORG }}
+          CF_SPACE: ${{ secrets.CF_SPACE }}
+        run: |
+          set -e
+          if [ -z "$CF_API" ] || [ -z "$CF_USERNAME" ] || [ -z "$CF_PASSWORD" ] || [ -z "$CF_ORG" ] || [ -z "$CF_SPACE" ]; then
+            echo "One or more required CF_* secrets are missing." >&2
+            exit 1
+          fi
+          cf api "$CF_API"
+          cf auth "$CF_USERNAME" "$CF_PASSWORD"
+          cf target -o "$CF_ORG" -s "$CF_SPACE"
+          cf target
+
+      - name: Deploy MTAR to Cloud Foundry
+        env:
+          MTAR_PATH: ${{ steps.find_mtar.outputs.mtar-path }}
+        run: |
+          set -e
+          if [ ! -f "$MTAR_PATH" ]; then
+            echo "MTAR not found at $MTAR_PATH" >&2
+            exit 1
+          fi
+          echo "Deploying $MTAR_PATH ..."
+          cf deploy "$MTAR_PATH" -f
