@@ -1,6 +1,7 @@
 # @capire/xflights
 
 This is a reuse package that manages master data like Airlines, Airports, and Flights.
+
 It is used in the [xtravels](https://github.com/capire/xtravels) application.
 
 ## Reuse
