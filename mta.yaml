@@ -58,5 +58,5 @@ resources:
       service-plan: application
       path: ./xs-security.json
       config:
-        xsappname: flight-${org}-${space}
+        xsappname: flight
         tenant-mode: dedicated
